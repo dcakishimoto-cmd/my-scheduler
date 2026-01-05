@@ -4,12 +4,16 @@ import { NextResponse } from 'next/server';
 // --- ① 空き時間を取得する機能 (GET) ---
 export async function GET() {
   try {
-    // Vercel用に「環境変数」から認証情報を読み込む設定
     const auth = new google.auth.GoogleAuth({
       credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '{}'),
       scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
     });
     const calendar = google.calendar({ version: 'v3', auth });
+
+    // 【重要】日本時間(JST)への変換設定
+    const JST_OFFSET = 9 * 60 * 60 * 1000; // 日本はUTC+9時間
+    const now = new Date();
+    const jstNow = new Date(now.getTime() + JST_OFFSET);
 
     const BUSINESS_HOUR_START = 10;
     const WEEKDAY_HOUR_END = 19;
@@ -18,15 +22,13 @@ export async function GET() {
     const LEAD_TIME_HOURS = 3;
     const DAYS_TO_CHECK = 14;
 
-    const now = new Date();
-    const leadTimeLimit = new Date(now.getTime() + (LEAD_TIME_HOURS * 60 * 60 * 1000));
-    const endRange = new Date();
-    endRange.setDate(now.getDate() + DAYS_TO_CHECK);
-
+    // 予約可能開始時刻（今から3時間後）
+    const leadTimeLimit = new Date(jstNow.getTime() + (LEAD_TIME_HOURS * 60 * 60 * 1000));
+    
     const response = await calendar.events.list({
       calendarId: process.env.GOOGLE_CALENDAR_ID,
-      timeMin: now.toISOString(),
-      timeMax: endRange.toISOString(),
+      timeMin: now.toISOString(), // カレンダーAPIにはUTCのまま投げる
+      timeMax: new Date(now.getTime() + (DAYS_TO_CHECK * 24 * 60 * 60 * 1000)).toISOString(),
       singleEvents: true,
       orderBy: 'startTime',
     });
@@ -35,20 +37,22 @@ export async function GET() {
     let availableSlots = [];
 
     for (let i = 0; i < DAYS_TO_CHECK; i++) {
-      let checkDate = new Date();
-      checkDate.setDate(now.getDate() + i);
-      const dayOfWeek = checkDate.getDay();
-      if (dayOfWeek === 0 || dayOfWeek === 3) continue;
+      let checkDateJST = new Date(jstNow.getTime() + (i * 24 * 60 * 60 * 1000));
+      const dayOfWeek = checkDateJST.getUTCDay(); // UTCベースで計算するためgetUTCDay
+      
+      if (dayOfWeek === 0 || dayOfWeek === 3) continue; // 日・水定休
 
       const currentEndHour = (dayOfWeek === 6) ? SATURDAY_HOUR_END : WEEKDAY_HOUR_END;
-      let startTime = new Date(checkDate);
-      startTime.setHours(BUSINESS_HOUR_START, 0, 0, 0);
-      let endTime = new Date(checkDate);
-      endTime.setHours(currentEndHour, 0, 0, 0);
 
-      if (startTime < leadTimeLimit) {
-        startTime = new Date(leadTimeLimit);
-        startTime.setMinutes(Math.ceil(startTime.getMinutes() / 15) * 15, 0, 0);
+      // 日本時間の「10:00」と「19:00」をUTC基準で作る
+      // 10:00 JST は 01:00 UTC / 19:00 JST は 10:00 UTC
+      let startTime = new Date(Date.UTC(checkDateJST.getUTCFullYear(), checkDateJST.getUTCMonth(), checkDateJST.getUTCDate(), BUSINESS_HOUR_START - 9, 0, 0));
+      let endTime = new Date(Date.UTC(checkDateJST.getUTCFullYear(), checkDateJST.getUTCMonth(), checkDateJST.getUTCDate(), currentEndHour - 9, 0, 0));
+
+      // 3時間前ルール適用
+      if (startTime.getTime() < (leadTimeLimit.getTime() - JST_OFFSET)) {
+        startTime = new Date(leadTimeLimit.getTime() - JST_OFFSET);
+        startTime.setUTCMinutes(Math.ceil(startTime.getUTCMinutes() / 15) * 15, 0, 0);
       }
 
       while (startTime.getTime() + SLOT_DURATION_MIN * 60000 <= endTime.getTime()) {
@@ -58,8 +62,9 @@ export async function GET() {
           const eventEnd = new Date(event.end?.dateTime || event.end?.date || "");
           return (startTime < eventEnd && slotEnd > eventStart);
         });
-        if (!isBusy) availableSlots.push(new Date(startTime).toISOString());
-        startTime.setMinutes(startTime.getMinutes() + 15);
+        
+        if (!isBusy) availableSlots.push(startTime.toISOString());
+        startTime.setUTCMinutes(startTime.getUTCMinutes() + 15);
       }
     }
     return NextResponse.json(availableSlots);
